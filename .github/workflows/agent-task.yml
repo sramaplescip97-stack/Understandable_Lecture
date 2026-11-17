@@ -38,6 +38,8 @@ jobs:
       BRANCH: agent/issue-${{ inputs.issue_number }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Issueの読み取りとガード（needs-humanなら実行しない）
         id: issue
@@ -87,25 +89,36 @@ jobs:
             作業が終わったら、何を変更したかを簡潔に報告してください。
           claude_args: "--model claude-sonnet-5-5 --max-turns 30"
 
-      - name: 変更の有無を確認
+      - name: 成果物の有無を確認
         id: changes
         run: |
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Claude Code による変更がありませんでした。"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            git status --short
+          tree_changed=false
+          if [ -n "$(git status --porcelain)" ]; then
+            tree_changed=true
           fi
+          ahead=$(git rev-list --count origin/main..HEAD)
+          echo "tree_changed=$tree_changed" >> "$GITHUB_OUTPUT"
+          echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+          if [ "$tree_changed" = "true" ] || [ "$ahead" -gt 0 ]; then
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "新規の変更も、main より先行したコミットもありませんでした。"
+          fi
+          git status --short
 
-      - name: コミット・push・PR作成
-        if: steps.changes.outputs.changed == 'true'
+      - name: コミット（作業ツリーに変更がある場合のみ）
+        if: steps.changes.outputs.tree_changed == 'true'
+        run: |
+          git add -A
+          git commit -m "Agent task: #${ISSUE} ${{ steps.issue.outputs.title }}"
+
+      - name: push・PR作成
+        if: steps.changes.outputs.has_work == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          git add -A
-          git commit -m "Agent task: #${ISSUE} ${{ steps.issue.outputs.title }}"
           # Claude Code Action の後処理で checkout の認証情報が消えるため、
           # push の前に GITHUB_TOKEN で remote を明示的に認証し直す
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
@@ -121,8 +134,8 @@ jobs:
           gh issue comment "$ISSUE" --body "ワーカーがPRを作成しました： $url
           CIの結果を確認して、マージはゆきかが行ってください。"
 
-      - name: 失敗・変更なし時の処理（tryを進める／上限なら人へ）
-        if: failure() || steps.changes.outputs.changed == 'false'
+      - name: 失敗・成果物なし時の処理（tryを進める／上限なら人へ）
+        if: failure() || steps.changes.outputs.has_work == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
