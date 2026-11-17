@@ -1,0 +1,2 @@
+# Understandable_Lecture
+自分の学習用に講義をわかりやすい形で再構成する
