@@ -106,6 +106,9 @@ jobs:
           set -e
           git add -A
           git commit -m "Agent task: #${ISSUE} ${{ steps.issue.outputs.title }}"
+          # Claude Code Action の後処理で checkout の認証情報が消えるため、
+          # push の前に GITHUB_TOKEN で remote を明示的に認証し直す
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git push origin "$BRANCH"
           if gh pr view "$BRANCH" > /dev/null 2>&1; then
             url=$(gh pr view "$BRANCH" --json url --jq .url)
