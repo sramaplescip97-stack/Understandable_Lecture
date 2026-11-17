@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: テンプレートファイルの存在確認
+        run: |
+          set -e
+          for f in .github/ISSUE_TEMPLATE/task.md .github/ISSUE_TEMPLATE/idea.md .github/pull_request_template.md; do
+            if [ ! -s "$f" ]; then
+              echo "Missing or empty: $f"
+              exit 1
+            fi
+            echo "OK: $f"
+          done
+
+      - name: Issueテンプレートの設定欄（front matter）の確認
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, sys
+          required = {
+              ".github/ISSUE_TEMPLATE/task.md": ["type:task", "status:ready", "try:1"],
+              ".github/ISSUE_TEMPLATE/idea.md": ["type:idea"],
+          }
+          ok = True
+          for path, needles in required.items():
+              text = pathlib.Path(path).read_text(encoding="utf-8")
+              if not text.startswith("---"):
+                  print(path + ": front matter not found at top")
+                  ok = False
+                  continue
+              for n in needles:
+                  if n not in text:
+                      print(path + ": missing " + n)
+                      ok = False
+          print("front matter OK" if ok else "front matter NG")
+          sys.exit(0 if ok else 1)
+          PYEOF
