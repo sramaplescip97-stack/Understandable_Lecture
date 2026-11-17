@@ -1,0 +1,137 @@
+name: Agent Task (手動実行)
+
+# ワーカーの最小形：Issue番号を指定して手動実行すると、
+# Claude Code ヘッドレスがそのタスクだけを実装し、PRを作る。
+# 自動トリガーはまだ付けない（1タスクを通せてから広げる）。
+#
+# 停止条件（Step 2で固定、docs/RULES.md）
+# - timeout-minutes: 30 → 1ジョブ30分で打ち切り
+# - concurrency → 同一Issueの多重起動を直列化（同時1）
+# - 試行上限3回: try:1〜try:3 ラベルで数え、失敗時に自動で進める。
+#   try:3 で失敗したら status:needs-human に付け替えて停止する
+# - 前提: リポジトリの Secrets に ANTHROPIC_API_KEY を登録しておくこと
+#   （本番用の鍵ではなく、このリポジトリ専用に発行した鍵を使うこと）
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "対象のIssue番号"
+        required: true
+        type: number
+
+concurrency:
+  group: agent-task-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      ISSUE: ${{ inputs.issue_number }}
+      BRANCH: agent/issue-${{ inputs.issue_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Issueの読み取りとガード（needs-humanなら実行しない）
+        id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          labels=$(gh issue view "$ISSUE" --json labels --jq '[.labels[].name] | join(",")')
+          echo "labels: $labels"
+          if echo ",$labels," | grep -q ",status:needs-human,"; then
+            echo "status:needs-human のため実行しません。人（ゆきか）の確認が必要です。"
+            exit 1
+          fi
+          gh issue view "$ISSUE" --json title,body --jq '"# " + .title + "\n\n" + .body' > "$RUNNER_TEMP/issue.md"
+          title=$(gh issue view "$ISSUE" --json title --jq .title)
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          gh issue edit "$ISSUE" --add-label "status:in-progress" --remove-label "status:ready" || true
+          if ! echo ",$labels," | grep -q ",try:"; then
+            gh issue edit "$ISSUE" --add-label "try:1"
+          fi
+
+      - name: 作業ブランチの用意
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+      - name: Claude Code ヘッドレスで実装
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            あなたはこのリポジトリの実装担当です。
+            タスク指示は ${{ runner.temp }}/issue.md にあります。まずそれを読んでください。
+            受け入れ条件を満たすよう、作業ディレクトリ内のファイルを編集してください。
+
+            禁止事項:
+            - git のコマンド（commit / push / branch / checkout 等）は実行しないこと。成果物の保存は後段の決定的ステップが行います
+            - 受け入れ条件（テスト仕様にあたる記述）を変更しないこと。条件自体が間違っていると思った場合はファイルを編集せず、その理由を ISSUE_NOTES.md に書いてください
+            - 課金・秘密情報・データ削除・外部送信に関わる操作はしないこと
+
+            作業が終わったら、何を変更したかを簡潔に報告してください。
+          claude_args: "--model claude-sonnet-5-5 --max-turns 30"
+
+      - name: 変更の有無を確認
+        id: changes
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Claude Code による変更がありませんでした。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git status --short
+          fi
+
+      - name: コミット・push・PR作成
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git add -A
+          git commit -m "Agent task: #${ISSUE} ${{ steps.issue.outputs.title }}"
+          git push origin "$BRANCH"
+          if gh pr view "$BRANCH" > /dev/null 2>&1; then
+            url=$(gh pr view "$BRANCH" --json url --jq .url)
+          else
+            url=$(gh pr create --title "Agent: #${ISSUE} ${{ steps.issue.outputs.title }}" --body "Issue #${ISSUE} の自動実装です。内容を確認してマージしてください。
+
+          Closes #${ISSUE}" --head "$BRANCH" --base main)
+          fi
+          echo "PR: $url"
+          gh issue comment "$ISSUE" --body "ワーカーがPRを作成しました： $url
+          CIの結果を確認して、マージはゆきかが行ってください。"
+
+      - name: 失敗・変更なし時の処理（tryを進める／上限なら人へ）
+        if: failure() || steps.changes.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          labels=$(gh issue view "$ISSUE" --json labels --jq '[.labels[].name] | join(",")')
+          echo "labels: $labels"
+          if echo ",$labels," | grep -q ",try:3,"; then
+            gh issue edit "$ISSUE" --remove-label "status:in-progress" --add-label "status:needs-human" || true
+            gh issue comment "$ISSUE" --body "試行上限（3回）に達したため停止しました。進行役が要約してゆきかへ報告します。"
+          elif echo ",$labels," | grep -q ",try:2,"; then
+            gh issue edit "$ISSUE" --remove-label "try:2" --add-label "try:3" || true
+            gh issue comment "$ISSUE" --body "実行に失敗しました。try:3 に進めました（残り試行1回）。再実行は手動dispatchで行ってください。"
+          else
+            gh issue edit "$ISSUE" --remove-label "try:1" --add-label "try:2" || true
+            gh issue comment "$ISSUE" --body "実行に失敗しました。try:2 に進めました。再実行は手動dispatchで行ってください。"
+          fi
